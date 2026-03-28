@@ -1,0 +1,195 @@
+package com.learn.javaagent.Agent03.config;
+
+import com.google.gson.JsonArray;
+import com.learn.javaagent.Agent03.skills.SkillLoader;
+import com.learn.javaagent.Agent03.tools.ToolRegistry;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Properties;
+
+/**
+ * 集中管理：配置键、默认值、classpath {@code agent.properties}、环境变量、系统提示词、工具声明及请求参数。
+ * <p>
+ * {@link #tools()} 由 {@link ToolRegistry#openAiTools()} 单一来源生成，与工具分发注册中心一致。
+ * </p>
+ *
+ * @author 298751
+ */
+public final class AgentConfig {
+
+    /** 配置文件（位于 classpath / {@code src/main/resources}） */
+    public static final String CONFIG_RESOURCE = "agent.properties";
+
+    public static final String KEY_API_KEY = "API_KEY";
+    public static final String KEY_MODEL_ID = "MODEL_ID";
+    public static final String KEY_API_BASE_URL = "API_BASE_URL";
+    public static final String KEY_API_AUTH_TOKEN = "API_AUTH_TOKEN";
+
+    /** 技能根目录（相对 {@link System#getProperty(String) user.dir}，或由 {@link #load()} 解析为绝对路径） */
+    public static final String KEY_SKILLS_DIR = "SKILLS_DIR";
+
+    /** 未配置 {@link #KEY_SKILLS_DIR} 时使用的默认技能目录（项目下 {@code agent03/skills}） */
+    public static final String DEFAULT_SKILLS_DIR = "agent03/skills";
+
+    /**
+     * 未配置 {@link #KEY_API_BASE_URL} 时使用的网关根路径（不含 {@code /chat/completions}）。
+     */
+    public static final String DEFAULT_API_BASE_URL =
+            "https://dashscope.aliyuncs.com/compatible-mode/v1";
+
+    /** Chat Completions：最大生成 token */
+    public static final int DEFAULT_MAX_TOKENS = 8000;
+    /** Chat Completions：工具选择策略 */
+    public static final String DEFAULT_TOOL_CHOICE = "auto";
+
+    private static final JsonArray TOOLS = buildToolDeclarations();
+
+    private AgentConfig() {
+    }
+
+    /**
+     * 由 {@link ToolRegistry} 组装的 OpenAI 兼容 {@code tools} 数组。
+     */
+    private static JsonArray buildToolDeclarations() {
+        return ToolRegistry.openAiTools();
+    }
+
+    /**
+     * OpenAI 兼容 {@code tools} 数组（{@code type:function} + {@code parameters}）。
+     */
+    public static JsonArray tools() {
+        return TOOLS;
+    }
+
+    /**
+     * 默认 system 提示词（含当前工作目录、{@link ToolRegistry} 工具名、以及技能第一层：仅名称与简短描述）。
+     * <p>
+     * 技能完整正文由 {@code load_skill} 工具在 tool_result 中按需注入，不放入本提示词。
+     * </p>
+     */
+    public static String systemPrompt() {
+        String cwd = Paths.get("").toAbsolutePath().normalize().toString();
+        StringBuilder sb = new StringBuilder();
+        sb.append("You are a coding agent at ").append(cwd);
+        sb.append(". You may use tools: ").append(ToolRegistry.toolNames());
+        sb.append(". When you need full instructions for a skill listed below, call load_skill(name) — ");
+        sb.append("the detailed text arrives in that tool result, not here.");
+        String skillLines = SkillLoader.getDefault().getDescriptions();
+        if (skillLines != null && !skillLines.trim().isEmpty()) {
+            sb.append("\n\nSkills available:\n").append(skillLines);
+        }
+        sb.append("\n\nUse the todo tool to plan multi-step tasks. Mark in_progress before starting, ");
+        sb.append("completed when done.\nPrefer tools over prose");
+        return sb.toString();
+    }
+
+    /**
+     * 解析技能根目录路径（classpath {@code agent.properties} 与环境变量中的 {@link #KEY_SKILLS_DIR}）。
+     *
+     * @return 绝对、规范化路径（目录未必已存在）
+     */
+    public static Path skillsDirectory() throws IOException {
+        Map<String, String> m = load();
+        String p = m.get(KEY_SKILLS_DIR);
+        if (p == null || p.trim().isEmpty()) {
+            p = DEFAULT_SKILLS_DIR;
+        }
+        return Paths.get(p.trim()).toAbsolutePath().normalize();
+    }
+
+    /**
+     * 从 classpath 与环境变量加载原始键值（环境变量覆盖文件）；并处理 {@code API_BASE_URL} 与 {@code API_AUTH_TOKEN} 互斥。
+     */
+    public static Map<String, String> load() throws IOException {
+        Map<String, String> m = new HashMap<>();
+        ClassLoader cl = AgentConfig.class.getClassLoader();
+        InputStream in = cl != null ? cl.getResourceAsStream(CONFIG_RESOURCE)
+                : ClassLoader.getSystemResourceAsStream(CONFIG_RESOURCE);
+        if (in != null) {
+            Properties p = new Properties();
+            try (InputStreamReader r = new InputStreamReader(in, StandardCharsets.UTF_8)) {
+                p.load(r);
+            }
+            for (String name : p.stringPropertyNames()) {
+                m.put(name, p.getProperty(name));
+            }
+        }
+        m.putAll(System.getenv());
+        String base = m.get(KEY_API_BASE_URL);
+        if (base != null && !base.trim().isEmpty()) {
+            m.remove(KEY_API_AUTH_TOKEN);
+        }
+        return m;
+    }
+
+    /**
+     * 解析后的网关根地址（未配置时使用 {@link #DEFAULT_API_BASE_URL}）。
+     */
+    public static String apiBaseUrl(Map<String, String> c) {
+        String u = c.get(KEY_API_BASE_URL);
+        return (u == null || u.trim().isEmpty()) ? DEFAULT_API_BASE_URL : u.trim();
+    }
+
+    /**
+     * 校验必填项并封装为一次运行所需配置。
+     *
+     * @throws IllegalStateException 缺少 {@link #KEY_API_KEY} 或 {@link #KEY_MODEL_ID}
+     */
+    public static RuntimeConfig loadRuntime() throws IOException {
+        Map<String, String> raw = load();
+        String apiKey = raw.get(KEY_API_KEY);
+        String modelId = raw.get(KEY_MODEL_ID);
+        if (apiKey == null || apiKey.trim().isEmpty()) {
+            throw new IllegalStateException("Missing " + KEY_API_KEY);
+        }
+        if (modelId == null || modelId.trim().isEmpty()) {
+            throw new IllegalStateException("Missing " + KEY_MODEL_ID);
+        }
+        return new RuntimeConfig(
+                apiKey.trim(),
+                modelId.trim(),
+                apiBaseUrl(raw),
+                systemPrompt()
+        );
+    }
+
+    /**
+     * 运行期配置快照（由 {@link #loadRuntime()} 生成）。
+     */
+    public static final class RuntimeConfig {
+        private final String apiKey;
+        private final String modelId;
+        private final String apiBaseUrl;
+        private final String systemPrompt;
+
+        RuntimeConfig(String apiKey, String modelId, String apiBaseUrl, String systemPrompt) {
+            this.apiKey = apiKey;
+            this.modelId = modelId;
+            this.apiBaseUrl = apiBaseUrl;
+            this.systemPrompt = systemPrompt;
+        }
+
+        public String getApiKey() {
+            return apiKey;
+        }
+
+        public String getModelId() {
+            return modelId;
+        }
+
+        public String getApiBaseUrl() {
+            return apiBaseUrl;
+        }
+
+        public String getSystemPrompt() {
+            return systemPrompt;
+        }
+    }
+}
